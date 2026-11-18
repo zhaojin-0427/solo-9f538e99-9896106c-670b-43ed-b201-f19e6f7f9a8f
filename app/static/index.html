@@ -33,14 +33,14 @@
   .ok { color: var(--ok); font-weight: 600; }
   .bad { color: var(--bad); font-weight: 600; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; }
-  .pill.ok { background: #dafbe1; } .pill.bad { background: #ffebe9; }
+  .pill.ok { background: #dafbe1; } .pill.bad { background: #ffebe9; } .pill.warn { background: #fff8c5; }
   .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
   #status { font-size: 12px; margin-top: 8px; min-height: 16px; }
 </style>
 </head>
 <body>
 <h1>空运危险品保管链控制台</h1>
-<p class="sub">录入运单与扫描批次、查询可信交接前缀。OpenAPI 交互文档见 <a href="/docs">/docs</a>。</p>
+<p class="sub">录入运单与扫描批次、查询可信交接前缀、生成暴露报告。OpenAPI 交互文档见 <a href="/docs">/docs</a>。</p>
 
 <div class="grid">
   <div class="card">
@@ -72,6 +72,19 @@
       <button onclick="queryChain()" style="margin-top:0">查询</button></div>
     <div id="chain-summary" style="margin-top:10px"></div>
     <div id="chain-table"></div>
+  </div>
+
+  <div class="card">
+    <h2>4. 暴露报告（核查某 UTC 时刻的保管方）</h2>
+    <label>被核查保管方</label><input id="rep-party" value="CX-CARGO" />
+    <label>UTC 时刻</label><input id="rep-at" value="2026-11-18T09:00:00Z" />
+    <button onclick="createReport()">生成报告</button>
+    <label style="margin-top:14px">按报告号查询</label>
+    <div class="row"><input id="rep-id" value="1" />
+      <button onclick="getReport()" class="secondary" style="margin-top:0">旧报告</button>
+      <button onclick="getChanges()" class="secondary" style="margin-top:0">与当前对比</button></div>
+    <div id="report-summary" style="margin-top:10px"></div>
+    <div id="report-table"></div>
   </div>
 
   <div class="card">
@@ -118,6 +131,65 @@ async function queryChain() {
   } catch (e) { setStatus('查询失败：' + e.message, true); }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+const CLS = {
+  CONFIRMED_AT_PARTY: ['确认在该方', 'ok'],
+  CONFIRMED_NOT_AT_PARTY: ['确认不在该方', 'bad'],
+  UNDETERMINABLE: ['无法判定', 'warn']
+};
+function basisText(b) {
+  if (!b) return '';
+  if (b.kind === 'HANDOVER') return `扫描 ${b.scan_id}（修订 ${b.revision}，${b.ts_utc}）`;
+  if (b.kind === 'ORIGIN') return `早于首笔交接，按起始方 ${b.origin_party}`;
+  return `断链 ${b.break_reason}：${(b.break_scan_ids || []).join(', ')} — ${b.break_detail || ''}`;
+}
+function renderReport(r) {
+  const s = r.summary;
+  $('report-summary').innerHTML =
+    `报告 #${esc(r.report_id)} · ${esc(r.party)} @ ${esc(r.at_utc)} — ` +
+    `在该方 <b>${s.confirmed_at_party}</b> / 不在该方 <b>${s.confirmed_not_at_party}</b> / 无法判定 <b>${s.undeterminable}</b>`;
+  $('report-table').innerHTML = '<table><tr><th>运单</th><th>结论</th><th>保管方</th><th>依据</th></tr>'
+    + r.waybills.map(w => {
+        const [label, cls] = CLS[w.classification] || [w.classification, ''];
+        return `<tr><td>${esc(w.waybill_id)}</td><td><span class="pill ${cls}">${label}</span></td>`
+          + `<td>${esc(w.custodian ?? '—')}</td><td>${esc(basisText(w.basis))}</td></tr>`;
+      }).join('') + '</table>';
+}
+function renderChanges(r) {
+  const changes = r.changes || [];
+  $('report-summary').innerHTML = changes.length
+    ? `报告 #${esc(r.report_id)} 与当前状态相比有 <b>${changes.length}</b> 笔变化`
+    : `报告 #${esc(r.report_id)} 与当前状态一致`;
+  $('report-table').innerHTML = changes.length
+    ? '<table><tr><th>运单</th><th>变化</th><th>原结论</th><th>新结论</th><th>新依据</th></tr>'
+      + changes.map(c => {
+          const [oldLabel] = CLS[c.previous_classification] || ['（报告后新增）'];
+          const [newLabel, cls] = CLS[c.new_classification] || [c.new_classification, ''];
+          return `<tr><td>${esc(c.waybill_id)}</td><td>${esc(c.change_type)}</td>`
+            + `<td>${esc(oldLabel)}</td><td><span class="pill ${cls}">${esc(newLabel)}</span></td>`
+            + `<td>${esc(basisText(c.current_basis))}</td></tr>`;
+        }).join('') + '</table>'
+    : '';
+}
+async function createReport() {
+  try {
+    const data = await call('/api/exposure-reports', 'POST',
+      {party: $('rep-party').value.trim(), at_utc: $('rep-at').value.trim()});
+    $('rep-id').value = data.report_id;
+    setStatus(`报告 #${data.report_id} 已生成`); renderReport(data);
+  } catch (e) { setStatus('生成失败（未留下报告）：' + e.message, true); }
+}
+async function getReport() {
+  try {
+    const data = await call(`/api/exposure-reports/${encodeURIComponent($('rep-id').value.trim())}`, 'GET');
+    setStatus('已读取旧报告（结论为当时结果）'); renderReport(data);
+  } catch (e) { setStatus('查询失败：' + e.message, true); }
+}
+async function getChanges() {
+  try {
+    const data = await call(`/api/exposure-reports/${encodeURIComponent($('rep-id').value.trim())}/changes`, 'GET');
+    setStatus('已与当前状态对比'); renderChanges(data);
+  } catch (e) { setStatus('查询失败：' + e.message, true); }
+}
 function renderChain(c) {
   const intact = c.chain_intact;
   $('chain-summary').innerHTML =

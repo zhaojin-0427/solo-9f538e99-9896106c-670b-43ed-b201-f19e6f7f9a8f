@@ -9,6 +9,9 @@ Concurrency model
   old chain").  Readers always see a fully committed snapshot, never a mix of
   revisions -- including after a process restart, because uncommitted data is
   never persisted.
+* :func:`read_snapshot` pins one committed snapshot across several reads
+  (exposure reports and their change comparisons), so interleaved writes can
+  never contribute some old and some new revisions to one result.
 """
 from __future__ import annotations
 
@@ -46,6 +49,21 @@ CREATE TABLE IF NOT EXISTS scans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_scans_waybill ON scans (waybill_id, scan_id, revision);
+
+-- Exposure reports are immutable snapshots: the conclusion, its basis and the
+-- exact set of waybills/scans it was computed from are stored as JSON and
+-- never recomputed.  A report row and its detail row are committed together.
+CREATE TABLE IF NOT EXISTS exposure_reports (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    party           TEXT NOT NULL,
+    at_utc          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    waybill_count   INTEGER NOT NULL,
+    at_party_count  INTEGER NOT NULL,
+    not_at_party_count INTEGER NOT NULL,
+    undeterminable_count INTEGER NOT NULL,
+    payload         TEXT NOT NULL
+);
 """
 
 
@@ -89,4 +107,25 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.rollback()
         raise
     else:
+        conn.commit()
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Hold one consistent committed snapshot for a sequence of reads.
+
+    SQLite in WAL mode pins the snapshot at the first ``SELECT`` inside a
+    read transaction, so writers that commit while we are reading are simply
+    invisible until the next snapshot.  This is what lets an exposure report
+    or its change comparison use one fixed waybill set and one fixed set of
+    scan revisions even when backfills/corrections/withdrawals interleave.
+    """
+    conn.execute("BEGIN;")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        # Read-only: committing releases the snapshot without changing data.
         conn.commit()
